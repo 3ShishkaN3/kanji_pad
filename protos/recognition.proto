@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package recognition;
+
+service RecognitionService {
+  rpc Recognize(RecognitionRequest) returns (RecognitionResponse) {}
+}
+
+
+message Point {
+  float x = 1;
+  float y = 2;
+}
+
+message BoundingBox {
+  Point min = 1;
+  Point max = 2;
+}
+
+message NormalizedStroke {
+  repeated Point points = 1;
+}
+
+message StrokeFeatures {
+  BoundingBox bounding_box = 1;
+  Point start_point = 2;
+  Point end_point = 3;
+  Point centroid = 4;
+  float length = 5;
+}
+
+message RecognitionRequest {
+  repeated NormalizedStroke normalized_strokes = 1;
+  
+  repeated StrokeFeatures stroke_features = 2;
+  
+  BoundingBox global_bounding_box = 3;
+  Point global_centroid = 4;
+
+  int32 top_n = 5;
+}
+
+message RecognitionResult {
+  string character = 1;
+  float distance = 2;
+  float confidence = 3;
+}
+
+message RecognitionResponse {
+  repeated RecognitionResult results = 1;
+}

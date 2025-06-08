@@ -1,3 +1,6 @@
 svgpathtools==1.7.1
 fastdtw==0.3.4
 numpy==2.2.6
+tqdm==4.67.1
+grpcio==1.72.1
+grpcio-tools==1.72.1

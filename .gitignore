@@ -1,4 +1,6 @@
 data/*
+assets/*
 env/
 .env
 *__pycache__
+recognition_pb2*
