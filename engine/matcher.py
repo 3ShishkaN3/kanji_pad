@@ -3,12 +3,12 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 from .data_models import NormalizedKanji, RecognitionResult
 
-POINTS_PER_STROKE = 32
-MAX_STROKES_IN_DB = 35 
+POINTS_PER_STROKE = 32 # Количество точек для ресемплинга каждого штриха
+MAX_STROKES_IN_DB = 35 # Максимальное число штрихов в базе данных
 
-W_SHAPE = 1.0     
-W_POSITION = 2.5   
-W_SIZE = 1.5       
+W_SHAPE = 1.0       # Вес для формы штриха     
+W_POSITION = 2.5    # Вес для позиции штриха
+W_SIZE = 1.5        # Вес для размера штриха       
 
 # Штраф за каждый лишний штрих в кандидате (для режима предикшна)
 STROKE_COUNT_PENALTY = 0.15 
@@ -45,24 +45,30 @@ class Matcher:
             predictive_mode: Если False (по умолчанию), сравнивает только с иероглифами
                              с таким же числом штрихов. Если True, ищет среди более сложных.
         """
+
+        # Подготовка данных пользователя
         user_tensor, user_features, user_count = self._preprocess_user_input(user_drawing)
         if user_count == 0: return []
 
+        # Фильтрация кандидатов по числу штрихов
         if predictive_mode:
             mask = (self.db_stroke_counts >= user_count)
         else:
             mask = (self.db_stroke_counts == user_count)
-            
+        
+        # Получение индексов кандидатов
         candidate_indices = np.where(mask)[0]
         if len(candidate_indices) == 0: return []
 
         scores = []
 
+        # Вычисление расстояний для каждого кандидата
         for global_idx in candidate_indices:
             db_count = self.db_stroke_counts[global_idx]
             
             cost = self._calculate_distance(user_tensor, user_features, global_idx)
             
+            # Применение штрафа за лишние штрихи в режиме предикшна
             if predictive_mode:
                 stroke_diff = db_count - user_count
                 cost *= (1 + stroke_diff * STROKE_COUNT_PENALTY)
@@ -94,37 +100,57 @@ class Matcher:
 
     def _calculate_distance(self, u_tensor, u_features, db_index):
         """
-        Воспроизводит вашу логику cost_matrix + linear_sum_assignment.
+        Логика cost_matrix + linear_sum_assignment.
+
+        :param u_tensor: Тензор штрихов пользователя (M, 32, 2).
+        :param u_features: Фичи штрихов пользователя (M, 3).
+        :param db_index: Индекс иероглифа в базе данных.
+        :return: Среднее расстояние после оптимального сопоставления штрихов.
+
+        * Примечание: Возвращает бесконечность, если у пользователя больше штрихов, чем в базе.
+        M - количество штрихов пользователя. 32 - количество точек на штрих. 2 - размерность точек (x, y).
+        3 - количество фичей на штрих (CentroidX, CentroidY, Length).
+        constants W_SHAPE, W_POSITION, W_SIZE используются для взвешивания различных аспектов расстояния.
         """
+
+        # Получение количества штрихов в базе
         db_count = self.db_stroke_counts[db_index]
         u_count = len(u_tensor)
         
         if u_count > db_count:
             return float('inf')
 
+        # Извлечение данных из кэша
         db_tensor = self.db_tensor[db_index][:db_count]
         db_features = self.db_features[db_index][:db_count]
 
+        # Вычисление матриц расстояний по форме, позиции и размеру
         diff = u_tensor[:, None, :, :] - db_tensor[None, :, :, :]
         dist_shape = np.sum(np.linalg.norm(diff, axis=3), axis=2)
         diff_rev = u_tensor[:, None, :, :] - db_tensor[None, :, ::-1, :]
         dist_shape_rev = np.sum(np.linalg.norm(diff_rev, axis=3), axis=2)
         final_dist_shape = np.minimum(dist_shape, dist_shape_rev)
 
+        # Позиционные различия
         u_pos = u_features[:, :2]
         db_pos = db_features[:, :2]
         dist_pos = np.linalg.norm(u_pos[:, None, :] - db_pos[None, :, :], axis=2)
 
+        # Размерные различия
         u_len = u_features[:, 2]
         db_len = db_features[:, 2]
         dist_size = np.abs(u_len[:, None] - db_len[None, :])
 
+        # Формирование итоговой матрицы стоимости
+        # Каждая ячейка представляет взвешенную сумму различий по форме, позиции и размеру
         cost_matrix = (
             (final_dist_shape * W_SHAPE) +
             (dist_pos * W_POSITION) +
             (dist_size * W_SIZE)
         )
 
+        # Решение задачи оптимального сопоставления
+        # Использутся Hungarian Algorithm (linear_sum_assignment)
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
         total_distance = cost_matrix[row_ind, col_ind].sum()
 
@@ -132,6 +158,9 @@ class Matcher:
 
     # Методы подготовки данных
     def _build_internal_caches(self):
+        """
+        Построение кэшей для быстрого доступа к данным базы.
+        """
         tensor_list, feat_list, chars_list, counts_list = [], [], [], []
         for char, kanji in self.database.items():
             raw_strokes = [np.array(s, dtype=np.float32) for s in kanji.normalized_strokes]
@@ -154,10 +183,22 @@ class Matcher:
         self.db_stroke_counts = np.array(counts_list, dtype=np.int32)
 
     def _preprocess_user_input(self, user_drawing):
+        """
+        Подготовка данных пользователя для сравнения.
+
+        :param user_drawing: NormalizedKanji от пользователя.
+        :return: (нормализованные штрихи, фичи, количество штрихов)
+
+        * Примечание: Возвращает None, None, 0 если нет штрихов.
+        """
+
+        # Преобразование штрихов пользователя в массивы numpy
         raw_strokes = [np.array(s, dtype=np.float32) for s in user_drawing.normalized_strokes]
         if not raw_strokes: return None, None, 0
         norm_strokes = self._normalize_kanji_geometry(raw_strokes)
         feats = []
+
+        # Вычисление фич для каждого штриха
         for s in norm_strokes:
             centroid = np.mean(s, axis=0)
             length = np.sum(np.linalg.norm(s[1:] - s[:-1], axis=1))
@@ -165,6 +206,12 @@ class Matcher:
         return np.array(norm_strokes), np.array(feats), len(norm_strokes)
 
     def _normalize_kanji_geometry(self, strokes):
+        """
+        Нормализация геометрии и ресемплинг штрихов.
+
+        :param strokes: Список штрихов (каждый - массив Nx2).
+        :return: Список нормализованных штрихов.
+        """
         resampled = [self._resample_stroke(s) for s in strokes]
         all_points = np.vstack(resampled)
         min_xy = all_points.min(axis=0)
@@ -174,6 +221,17 @@ class Matcher:
         return [(s - min_xy) / max_dim for s in resampled]
 
     def _resample_stroke(self, stroke, n=POINTS_PER_STROKE):
+        """
+        Ресемплинг штриха до n точек.
+
+        :param stroke: Массив Nx2 точек штриха.
+        :param n: Целевое количество точек.
+        :return: Массив n x 2 точек штриха.
+
+        * Примечание: Если штрих состоит из одной точки, возвращает n копий этой точки.
+        N - исходное количество точек штриха. N x 2 - размерность точек (x, y).
+        n - желаемое количество точек после ресемплинга. n x 2 - размерность точек после ресемплинга.
+        """
         if len(stroke) == n: return stroke
         dists = np.sqrt(np.sum(np.diff(stroke, axis=0)**2, axis=1))
         cum_dist = np.insert(np.cumsum(dists), 0, 0)

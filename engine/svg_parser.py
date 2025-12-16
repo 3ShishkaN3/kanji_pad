@@ -10,7 +10,7 @@ from .data_models import KanjiComponent, StrokeData
 KVG_NS = "http://kanjivg.tagaini.net"
 ET.register_namespace("kvg", KVG_NS)
 
-def _parse_group_node(node: ET.Element, stroke_counter: dict) -> KanjiComponent: # type: ignore[reportGeneralTypeIssues]
+def _parse_group_node(node: ET.Element, stroke_counter: dict) -> KanjiComponent:
     """Рекурсивная вспомогательная функция для парсинга тегов <g>."""
     
     attributes = {k.replace(f'{{{KVG_NS}}}', 'kvg:'): v 
@@ -21,20 +21,20 @@ def _parse_group_node(node: ET.Element, stroke_counter: dict) -> KanjiComponent:
     
     for child in node:
         if child.tag.endswith('g'):
-            child_components.append(_parse_group_node(child, stroke_counter)) # type: ignore[reportGeneralTypeIssues]
+            child_components.append(_parse_group_node(child, stroke_counter)) 
         elif child.tag.endswith('path'):
             stroke_counter['count'] += 1
             stroke_data = StrokeData(
-                id_number=stroke_counter['count'], # type: ignore[reportGeneralTypeIssues]
+                id_number=stroke_counter['count'],
                 path_data=child.attrib.get('d', ''),
                 stroke_type=child.attrib.get(f'{{{KVG_NS}}}type')
             )
-            child_strokes.append(stroke_data) # type: ignore[reportGeneralTypeIssues]
+            child_strokes.append(stroke_data)
             
     return KanjiComponent(
         attributes=attributes,
-        strokes=child_strokes, # type: ignore[reportGeneralTypeIssues]
-        children=child_components # type: ignore[reportGeneralTypeIssues]
+        strokes=child_strokes,
+        children=child_components
     )
 
 def parse_svg_file(filepath: str) -> KanjiComponent:

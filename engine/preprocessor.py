@@ -30,10 +30,10 @@ def _calculate_stroke_features(stroke: NormalizedStroke) -> StrokeFeatures:
     length = np.sum(np.sqrt(np.sum(np.diff(points, axis=0)**2, axis=1)))
     
     return StrokeFeatures(
-        bounding_box=(min_coords, max_coords), # type: ignore
-        start_point=tuple(points[0]), # type: ignore
-        end_point=tuple(points[-1]), # type: ignore
-        centroid=tuple(points.mean(axis=0)), # type: ignore
+        bounding_box=(min_coords, max_coords),
+        start_point=tuple(points[0]),
+        end_point=tuple(points[-1]),
+        centroid=tuple(points.mean(axis=0)),
         length=float(length)
     )
 
@@ -88,33 +88,32 @@ def _normalize_kanji(strokes: list[NormalizedStroke]) -> list[NormalizedStroke]:
     if not strokes or not any(strokes):
         return []
 
-    # Собираем все точки в один numpy массив для эффективных вычислений
+    # сбор всех точек в один numpy массив для эффективных вычислений
     all_points = np.array([point for stroke in strokes for point in stroke])
 
     min_coords = all_points.min(axis=0)
     max_coords = all_points.max(axis=0)
 
-    # Сдвигаем все точки так, чтобы левый верхний угол был в (0, 0)
+    # сдвиг всех точек так, чтобы левый верхний угол был в (0, 0)
     points_translated = all_points - min_coords
-    
-    # Рассчитываем размеры и масштаб
+
     size = max_coords - min_coords
     # Чтобы избежать деления на ноль для иероглифов, состоящих из одной точки
     size[size == 0] = 1
 
     scale = 100.0 / size.max()
     
-    # Масштабируем
+    # масштабирование
     points_scaled = points_translated * scale
 
-    # Вычисляем сдвиг для центрирования
+    # расчёт сдвига для центрирования
     scaled_size = size * scale
     offset = (100.0 - scaled_size) / 2.0
     
-    # Применяем сдвиг
+    # сдвиг для центрирования
     points_normalized = points_scaled + offset
 
-    # Собираем точки обратно в структуру штрихов
+    # точки обратно в структуру штрихов
     normalized_strokes = []
     start_index = 0
     for stroke in strokes:
