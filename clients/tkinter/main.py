@@ -177,6 +177,8 @@ class KanjiPadApp:
         if len(self.current_stroke_raw) > 1:
             self.user_drawing_raw.append(self.current_stroke_raw)
         self.current_stroke_raw = []
+        # Автоматически запускать распознавание после каждой завершённой черты
+        self._recognize_drawing()
 
     def _clear_canvas(self):
         """Очищает холст и все связанные данные."""
