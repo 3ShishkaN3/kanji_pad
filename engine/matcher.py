@@ -1,35 +1,32 @@
 import pickle
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 from .data_models import NormalizedKanji, RecognitionResult
 
-# --- КОНСТАНТЫ ---
-# Количество точек в штрихе для векторизации (чем больше, тем точнее форма, но медленнее)
 POINTS_PER_STROKE = 32
-# Максимальное кол-во штрихов, которое мы ожидаем в базе (для создания тензора фиксированного размера)
 MAX_STROKES_IN_DB = 35 
 
+W_SHAPE = 1.0     
+W_POSITION = 2.5   
+W_SIZE = 1.5       
+
+# Штраф за каждый лишний штрих в кандидате (для режима предикшна)
+STROKE_COUNT_PENALTY = 0.15 
+
 class Matcher:
-    """
-    Класс, инкапсулирующий логику распознавания иероглифов.
-    """
     def __init__(self, database_path: str):
-        """
-        Инициализирует Matcher, загружая базу данных.
-        """
         self.database: dict[str, NormalizedKanji] = self._load_database(database_path)
         
-        # Кэши для быстрого векторного доступа
-        # self.db_tensor: (N_Kanji, MAX_STROKES, POINTS_PER_STROKE, 2)
-        self.db_tensor = None 
+        # Кэши для быстрого доступа
+        self.db_tensor = None      # (N, MaxS, 32, 2) - геометрия
+        self.db_features = None    # (N, MaxS, 4) - фичи: [CentroidX, CentroidY, Length]
         self.db_chars = []
         self.db_stroke_counts = []
         
         self._build_internal_caches()
-        
-        print(f"Matcher initialized with {len(self.database)} kanji entries.")
+        print(f"Matcher initialized with {len(self.database)} kanji entries. (High-Accuracy Mode)")
 
-    def _load_database(self, path: str) -> dict[str, NormalizedKanji]:
-        """Загружает базу данных из файла .pkl."""
+    def _load_database(self, path: str):
         try:
             with open(path, 'rb') as f:
                 return pickle.load(f)
@@ -38,185 +35,151 @@ class Matcher:
         except Exception as e:
             raise RuntimeError(f"Failed to load or parse database file '{path}': {e}")
 
-    def recognize(self, user_drawing: NormalizedKanji, top_n: int = 5) -> list[RecognitionResult]:
+    def recognize(self, user_drawing: NormalizedKanji, top_n: int = 5, predictive_mode: bool = False) -> list[RecognitionResult]:
         """
         Основной метод распознавания.
+
+        Args:
+            user_drawing: Объект NormalizedKanji от пользователя.
+            top_n: Количество результатов.
+            predictive_mode: Если False (по умолчанию), сравнивает только с иероглифами
+                             с таким же числом штрихов. Если True, ищет среди более сложных.
         """
-        user_tensor, user_count = self._preprocess_user_input(user_drawing)
-        
-        if user_count == 0:
-            return []
+        user_tensor, user_features, user_count = self._preprocess_user_input(user_drawing)
+        if user_count == 0: return []
 
-        # Логика предикшна: ищем иероглифы, у которых штрихов >= чем нарисовано
-        # Эвристика: не больше чем +10 штрихов, чтобы отсечь совсем сложные
-        mask = (self.db_stroke_counts >= user_count) & (self.db_stroke_counts <= user_count + 10)
+        if predictive_mode:
+            mask = (self.db_stroke_counts >= user_count)
+        else:
+            mask = (self.db_stroke_counts == user_count)
+            
         candidate_indices = np.where(mask)[0]
-        
-        if len(candidate_indices) == 0:
-            return []
+        if len(candidate_indices) == 0: return []
 
-        # Shape: (N_Candidates, MAX_STROKES, 32, 2)
-        subset_db = self.db_tensor[candidate_indices]
+        scores = []
 
-        # Нам нужно найти: насколько каждый штрих юзера похож на ЛУЧШИЙ штрих кандидата.
-        
-        # Инициализируем массив очков (расстояний) для кандидатов
-        scores = np.zeros(len(candidate_indices), dtype=np.float32)
+        for global_idx in candidate_indices:
+            db_count = self.db_stroke_counts[global_idx]
+            
+            cost = self._calculate_distance(user_tensor, user_features, global_idx)
+            
+            if predictive_mode:
+                stroke_diff = db_count - user_count
+                cost *= (1 + stroke_diff * STROKE_COUNT_PENALTY)
+                
+            scores.append((global_idx, cost))
 
-        # Цикл только по штрихам пользователя (их мало, обычно 1-10).
-        # Внутренний цикл по базе (тысячи элементов) делает NumPy на C-скорости.
-        for i in range(user_count):
-            u_stroke = user_tensor[i]  # (32, 2)
-            
-            # Вычитаем штрих юзера из ВСЕХ штрихов ВСЕХ кандидатов сразу
-            # subset_db: (N, MaxS, 32, 2)
-            # u_stroke:  (32, 2) -> broadcast -> (N, MaxS, 32, 2)
-            
-            diff = subset_db - u_stroke
-            
-            # Евклидово расстояние: sqrt(sum(dx^2 + dy^2))
-            # (N, MaxS, 32, 2) -> norm -> (N, MaxS, 32) -> sum -> (N, MaxS)
-            # Суммируем расстояние по всем точкам штриха
-            dists = np.sum(np.linalg.norm(diff, axis=3), axis=2)
-            
-            diff_rev = subset_db - u_stroke[::-1]
-            dists_rev = np.sum(np.linalg.norm(diff_rev, axis=3), axis=2)
-            
-            # Берем минимум (прямое или обратное)
-            dists = np.minimum(dists, dists_rev)
-            
-            # Для текущего штриха юзера находим САМЫЙ похожий штрих внутри каждого иероглифа
-            # min по оси штрихов (axis=1) -> (N,)
-            best_match_dists = np.min(dists, axis=1)
-            
-            # Добавляем к общему штрафу кандидата
-            scores += best_match_dists
-
-        # Делим на кол-во штрихов, чтобы получить среднее расстояние
-        avg_scores = scores / user_count
-
-        # Быстрая сортировка топ-N через argpartition
-        k = min(top_n, len(avg_scores))
-        if k == 0: return []
-        
-        # Получаем индексы лучших локально в subset
-        best_local_indices = np.argpartition(avg_scores, k-1)[:k]
-        
-        # Сортируем эти топ-K (так как argpartition не гарантирует порядок)
-        top_k_scores = avg_scores[best_local_indices]
-        sorted_order = np.argsort(top_k_scores)
+        scores.sort(key=lambda item: item[1])
         
         results = []
-        min_distance = top_k_scores[sorted_order[0]] + 1e-6 # Защита от деления на 0
+        if not scores: return []
+        
+        min_distance = scores[0][1] + 1e-6
 
-        for idx in sorted_order:
-            local_idx = best_local_indices[idx]
-            global_idx = candidate_indices[local_idx]
+        for glob_idx, dist in scores[:top_n]:
+            char = self.db_chars[glob_idx]
             
-            dist = top_k_scores[idx]
-            char = self.db_chars[global_idx]
-            
-            # Ваша логика уверенности
             if dist <= min_distance:
                 confidence = 1.0
             else:
                 confidence = min_distance / dist
-
+            
             results.append(RecognitionResult(
                 character=char,
                 distance=round(float(dist), 2),
                 confidence=round(float(confidence), 4)
             ))
-
+            
         return results
 
-    def _build_internal_caches(self) -> None:
+    def _calculate_distance(self, u_tensor, u_features, db_index):
         """
-        Превращает словарь NormalizedKanji в оптимизированный 4D тензор NumPy.
-        Это выполняется 1 раз при старте сервера.
+        Воспроизводит вашу логику cost_matrix + linear_sum_assignment.
         """
-        tensor_list = []
-        chars_list = []
-        counts_list = []
+        db_count = self.db_stroke_counts[db_index]
+        u_count = len(u_tensor)
+        
+        if u_count > db_count:
+            return float('inf')
 
-        print("Building vectorized cache...")
+        db_tensor = self.db_tensor[db_index][:db_count]
+        db_features = self.db_features[db_index][:db_count]
 
+        diff = u_tensor[:, None, :, :] - db_tensor[None, :, :, :]
+        dist_shape = np.sum(np.linalg.norm(diff, axis=3), axis=2)
+        diff_rev = u_tensor[:, None, :, :] - db_tensor[None, :, ::-1, :]
+        dist_shape_rev = np.sum(np.linalg.norm(diff_rev, axis=3), axis=2)
+        final_dist_shape = np.minimum(dist_shape, dist_shape_rev)
+
+        u_pos = u_features[:, :2]
+        db_pos = db_features[:, :2]
+        dist_pos = np.linalg.norm(u_pos[:, None, :] - db_pos[None, :, :], axis=2)
+
+        u_len = u_features[:, 2]
+        db_len = db_features[:, 2]
+        dist_size = np.abs(u_len[:, None] - db_len[None, :])
+
+        cost_matrix = (
+            (final_dist_shape * W_SHAPE) +
+            (dist_pos * W_POSITION) +
+            (dist_size * W_SIZE)
+        )
+
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        total_distance = cost_matrix[row_ind, col_ind].sum()
+
+        return total_distance / u_count
+
+    # Методы подготовки данных
+    def _build_internal_caches(self):
+        tensor_list, feat_list, chars_list, counts_list = [], [], [], []
         for char, kanji in self.database.items():
-            # Получаем сырые штрихи
             raw_strokes = [np.array(s, dtype=np.float32) for s in kanji.normalized_strokes]
-            if not raw_strokes:
-                continue
-
-            # Нормализуем иероглиф (Scale & Center)
+            if not raw_strokes: continue
             norm_strokes = self._normalize_kanji_geometry(raw_strokes)
-            
-            # Создаем пустой массив штрихов, заполненный "бесконечностью"
-            # Inf нужен, чтобы np.min() игнорировал пустые слоты
-            padded_char = np.full((MAX_STROKES_IN_DB, POINTS_PER_STROKE, 2), np.inf, dtype=np.float32)
-            
-            # Заполняем реальными штрихами
+            padded_geo = np.full((MAX_STROKES_IN_DB, POINTS_PER_STROKE, 2), np.nan, dtype=np.float32)
+            padded_feat = np.full((MAX_STROKES_IN_DB, 3), np.nan, dtype=np.float32)
             for i, stroke in enumerate(norm_strokes[:MAX_STROKES_IN_DB]):
-                padded_char[i] = stroke
-
-            tensor_list.append(padded_char)
+                padded_geo[i] = stroke
+                centroid = np.mean(stroke, axis=0)
+                length = np.sum(np.linalg.norm(stroke[1:] - stroke[:-1], axis=1))
+                padded_feat[i] = [centroid[0], centroid[1], length]
+            tensor_list.append(padded_geo)
+            feat_list.append(padded_feat)
             chars_list.append(char)
             counts_list.append(len(norm_strokes))
-
-        # Финализация массивов
-        self.db_tensor = np.array(tensor_list, dtype=np.float32)
+        self.db_tensor = np.array(tensor_list)
+        self.db_features = np.array(feat_list)
         self.db_chars = np.array(chars_list)
         self.db_stroke_counts = np.array(counts_list, dtype=np.int32)
 
-    def _preprocess_user_input(self, user_drawing: NormalizedKanji):
-        """Подготовка ввода пользователя к тому же формату, что и база."""
+    def _preprocess_user_input(self, user_drawing):
         raw_strokes = [np.array(s, dtype=np.float32) for s in user_drawing.normalized_strokes]
-        if not raw_strokes:
-            return None, 0
-            
-        # Та же нормализация, что и для базы!
+        if not raw_strokes: return None, None, 0
         norm_strokes = self._normalize_kanji_geometry(raw_strokes)
-        return np.array(norm_strokes, dtype=np.float32), len(norm_strokes)
+        feats = []
+        for s in norm_strokes:
+            centroid = np.mean(s, axis=0)
+            length = np.sum(np.linalg.norm(s[1:] - s[:-1], axis=1))
+            feats.append([centroid[0], centroid[1], length])
+        return np.array(norm_strokes), np.array(feats), len(norm_strokes)
 
-    def _normalize_kanji_geometry(self, strokes: list[np.ndarray]) -> list[np.ndarray]:
-        """
-        Центрирует и масштабирует весь иероглиф в квадрат (0,0)-(1,1).
-        Также ресемплит каждый штрих до POINTS_PER_STROKE точек.
-        """
-        # Ресемплинг приводит к 32 точкам
-        resampled = [self._resample_stroke(s, POINTS_PER_STROKE) for s in strokes]
-        
-        # общий Bounding Box иероглифа
+    def _normalize_kanji_geometry(self, strokes):
+        resampled = [self._resample_stroke(s) for s in strokes]
         all_points = np.vstack(resampled)
         min_xy = all_points.min(axis=0)
         max_xy = all_points.max(axis=0)
-        
-        dims = max_xy - min_xy
-        max_dim = np.max(dims)
+        max_dim = np.max(max_xy - min_xy)
         if max_dim == 0: max_dim = 1.0
-        
-        normalized = []
-        for s in resampled:
-            # Сдвиг в 0 + Масштаб
-            s_norm = (s - min_xy) / max_dim
-            normalized.append(s_norm)
-            
-        return normalized
+        return [(s - min_xy) / max_dim for s in resampled]
 
-    def _resample_stroke(self, stroke: np.ndarray, n: int) -> np.ndarray:
-        """Интерполяция штриха к фиксированному числу точек N."""
-        if len(stroke) == n: 
-            return stroke
-            
+    def _resample_stroke(self, stroke, n=POINTS_PER_STROKE):
+        if len(stroke) == n: return stroke
         dists = np.sqrt(np.sum(np.diff(stroke, axis=0)**2, axis=1))
         cum_dist = np.insert(np.cumsum(dists), 0, 0)
         total_len = cum_dist[-1]
-        
-        if total_len == 0:
-            return np.tile(stroke[0], (n, 1))
-            
-        # Линейная интерполяция
-        target_dists = np.linspace(0, total_len, n)
-        x = np.interp(target_dists, cum_dist, stroke[:, 0])
-        y = np.interp(target_dists, cum_dist, stroke[:, 1])
-        
+        if total_len == 0: return np.tile(stroke[0], (n, 1))
+        t = np.linspace(0, total_len, n)
+        x = np.interp(t, cum_dist, stroke[:, 0])
+        y = np.interp(t, cum_dist, stroke[:, 1])
         return np.stack((x, y), axis=1)
